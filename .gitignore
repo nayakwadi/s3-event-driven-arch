@@ -1,0 +1,30 @@
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# ---- Python artifacts ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- Packaging / build output ----
+*.zip
+packaged*.yaml
+packaged*.yml
+
+# ---- AWS / local credentials & config (never commit secrets) ----
+.aws/
+*.pem
+*.env
+.env
+samconfig.toml
+
+# ---- Local CloudFormation / deploy scratch ----
+cfn-outputs.json
+outputs*.json

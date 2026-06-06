@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  S3 Event-Driven Architecture demo. Provisions an S3 bucket, a single
+  "message-printer" Lambda, an SNS topic, an SQS queue, and an EventBridge rule,
+  together with ALL the permissions/policies S3 needs to invoke each destination.
+  The S3 event notifications themselves are wired up manually in the console as a
+  learning exercise (see the Scenario guides). No resource names are hardcoded -
+  everything derives from the ProjectName parameter plus the account and region.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: s3-event-demo
+    AllowedPattern: '^[a-z][a-z0-9-]{1,38}[a-z0-9]$'
+    ConstraintDescription: >-
+      Lowercase letters, digits and hyphens only (3-40 chars). Used as a prefix
+      for all resource names, so it must be S3-bucket-name safe.
+    Description: Prefix used to name every resource in this stack.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: How many days to retain the Lambda's CloudWatch Logs.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---- S3 bucket -----------------------------------------------------------
+  # NOTE: intentionally has NO NotificationConfiguration. Students add the
+  # S3 -> Lambda / SNS / SQS / EventBridge wiring by hand in each scenario.
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- Lambda execution role ----------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-demo-queue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Required so the SQS -> Lambda event source mapping can poll.
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DemoQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- CloudWatch Log group (explicit, so retention is managed) -----------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-message-printer'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---- The "message-printer" Lambda ---------------------------------------
+  # Inlined so the stack is fully self-contained. Keep this in sync with the
+  # repo's print_trigger_lambda.py (the readable reference copy).
+  MessagePrinterLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-message-printer'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def detect_event_source(event):
+              if 'Records' in event and len(event['Records']) > 0:
+                  first_record = event['Records'][0]
+                  if 'Sns' in first_record:
+                      return 'SNS'
+                  if first_record.get('eventSource') == 'aws:sqs':
+                      return 'SQS'
+                  if first_record.get('eventSource') == 'aws:s3':
+                      return 'S3'
+              if 'source' in event and 'detail-type' in event and 'detail' in event:
+                  detail_type = event.get('detail-type', '')
+                  if detail_type != 'AWS API Call via CloudTrail' and event.get('source') == 'aws.s3':
+                      return 'EventBridge (S3 Object Event)'
+                  return 'Unknown'
+              return 'Unknown'
+
+          def lambda_handler(event, context):
+              try:
+                  event_source = detect_event_source(event)
+                  if event_source == 'Unknown':
+                      if event.get('detail-type') == 'AWS API Call via CloudTrail':
+                          return {'statusCode': 200, 'body': json.dumps({
+                              'message': 'CloudTrail event ignored',
+                              'eventSource': 'CloudTrail (ignored)'})}
+                  logger.info("========================================")
+                  logger.info(f"LAMBDA TRIGGERED BY: {event_source}")
+                  logger.info("========================================")
+                  logger.info("Event received")
+                  logger.info(json.dumps(event, indent=2, default=str))
+                  return {'statusCode': 200, 'body': json.dumps({
+                      'message': 'Event processed successfully',
+                      'eventSource': event_source})}
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===========================================================================
+  # Scenario 1: S3 -> Lambda (direct event notification)
+  # ===========================================================================
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MessagePrinterLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt DemoBucket.Arn
+
+  # ===========================================================================
+  # Scenario 2: S3 -> SNS -> Lambda
+  # ===========================================================================
+  DemoTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-topic'
+      DisplayName: !Sub '${ProjectName} S3 events'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Allow S3 (from this bucket) to publish to the topic.
+  DemoTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DemoTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref DemoTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt DemoBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  LambdaSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DemoTopic
+      Protocol: lambda
+      Endpoint: !GetAtt MessagePrinterLambda.Arn
+
+  SnsInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MessagePrinterLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DemoTopic
+
+  # ===========================================================================
+  # Scenario 4: S3 -> SQS -> Lambda
+  # ===========================================================================
+  DemoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-queue'
+      MessageRetentionPeriod: 345600  # 4 days
+      VisibilityTimeout: 60           # >= Lambda timeout (30s) + headroom
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Allow S3 (from this bucket) to send messages to the queue.
+  DemoQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DemoQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DemoQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt DemoBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Poll-based trigger: SQS -> Lambda. Created here so students only have to
+  # wire S3 -> SQS in the console.
+  SqsToLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DemoQueue.Arn
+      FunctionName: !GetAtt MessagePrinterLambda.Arn
+      BatchSize: 1
+      Enabled: true
+
+  # ===========================================================================
+  # Scenario 3: S3 -> EventBridge -> Lambda (default event bus)
+  # ===========================================================================
+  S3EventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-s3-events-rule'
+      Description: Routes all S3 object events from the default bus to the Lambda.
+      EventPattern:
+        source:
+          - aws.s3
+      State: ENABLED
+      Targets:
+        - Id: MessagePrinterTarget
+          Arn: !GetAtt MessagePrinterLambda.Arn
+
+  EventBridgeInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MessagePrinterLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3EventsRule.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs - the Scenario guides reference these instead of hardcoded names.
+# ---------------------------------------------------------------------------
+Outputs:
+  BucketName:
+    Description: Name of the demo S3 bucket (upload/delete test files here).
+    Value: !Ref DemoBucket
+
+  LambdaFunctionName:
+    Description: Name of the message-printer Lambda (view its CloudWatch Logs).
+    Value: !Ref MessagePrinterLambda
+
+  LogGroupName:
+    Description: CloudWatch Log group where trigger messages appear.
+    Value: !Ref LambdaLogGroup
+
+  SnsTopicArn:
+    Description: ARN of the SNS topic (Scenario 2 destination).
+    Value: !Ref DemoTopic
+
+  SqsQueueUrl:
+    Description: URL of the SQS queue (Scenario 4 destination).
+    Value: !Ref DemoQueue
+
+  SqsQueueArn:
+    Description: ARN of the SQS queue.
+    Value: !GetAtt DemoQueue.Arn
+
+  Region:
+    Description: Region this stack is deployed in.
+    Value: !Ref AWS::Region
+
+  LogsConsoleLink:
+    Description: Direct link to the Lambda log group in the console.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${ProjectName}-message-printer'
