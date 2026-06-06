@@ -20,8 +20,9 @@ S3 (demo bucket) ─────────┼──▶ Amazon SNS  ──▶ s
 ```
 
 The editable diagram is in [S3_Event_Driven_Architecture.drawio](S3_Event_Driven_Architecture.drawio)
-(![alt text](S3_Event_Driven_Architecture.drawio.png))
 (open at [draw.io](https://app.diagrams.net)).
+
+(![alt text](S3_Event_Arch.png))
 
 ### The four trigger mechanisms
 
